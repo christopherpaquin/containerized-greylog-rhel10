@@ -1,0 +1,46 @@
+# MongoDB - Graylog cluster metadata store.
+# Rendered from this template by deploy.sh (envsubst). Do not edit the
+# installed copy under /etc/containers/systemd/ directly - edit this file
+# and re-run deploy.sh.
+#
+# Never published to the host: reachable only from other containers on
+# the graylog-net network, by container name.
+
+[Unit]
+Description=Graylog stack - MongoDB
+
+[Container]
+Image=${MONGODB_IMAGE}:${MONGODB_VERSION}
+ContainerName=${MONGODB_CONTAINER_NAME}
+HostName=${MONGODB_CONTAINER_NAME}
+Network=graylog.network
+
+Volume=${MONGODB_DB_DIR}:/data/db:Z
+Volume=${MONGODB_CONFIGDB_DIR}:/data/configdb:Z
+
+Environment=MONGO_INITDB_DATABASE=${MONGO_INITDB_DATABASE}
+Environment=MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME}
+Environment=TZ=${TZ}
+Secret=graylog-stack-mongo-root-password,type=env,target=MONGO_INITDB_ROOT_PASSWORD
+
+NoNewPrivileges=true
+DropCapability=ALL
+# The official mongo entrypoint starts as root to fix ownership/permissions
+# on the bind-mounted data directory, then drops privileges to the mongodb
+# user itself (gosu) - it needs these capabilities for that one-time step.
+AddCapability=CHOWN DAC_OVERRIDE FOWNER SETGID SETUID
+
+HealthCmd=mongosh --quiet -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.adminCommand('ping')"
+HealthInterval=10s
+HealthTimeout=5s
+HealthStartPeriod=30s
+HealthRetries=6
+Notify=healthy
+
+[Service]
+TimeoutStartSec=300
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target default.target

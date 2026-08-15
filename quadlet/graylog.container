@@ -1,0 +1,62 @@
+# Graylog server - web UI, REST API, syslog inputs.
+# Rendered from this template by deploy.sh (envsubst). Do not edit the
+# installed copy under /etc/containers/systemd/ directly - edit this file
+# and re-run deploy.sh.
+#
+# Publishes: 9000/tcp (web/API), SYSLOG_TCP_PORT/tcp and SYSLOG_UDP_PORT/udp
+# (syslog inputs, created idempotently by deploy.sh via the REST API after
+# first boot - Graylog does not listen on the syslog ports until the input
+# exists).
+
+[Unit]
+Description=Graylog stack - Graylog server
+After=mongodb.service graylog-datanode.service
+Requires=mongodb.service graylog-datanode.service
+
+[Container]
+Image=${GRAYLOG_IMAGE}:${GRAYLOG_VERSION}
+ContainerName=${GRAYLOG_CONTAINER_NAME}
+HostName=${GRAYLOG_CONTAINER_NAME}
+Network=graylog.network
+
+Volume=${GRAYLOG_DATA_DIR}:/usr/share/graylog/data:Z
+
+PublishPort=${GRAYLOG_HTTP_PORT}:9000/tcp
+PublishPort=${SYSLOG_TCP_PORT}:1514/tcp
+PublishPort=${SYSLOG_UDP_PORT}:1514/udp
+
+Environment=GRAYLOG_NODE_ID_FILE=/usr/share/graylog/data/data/node-id
+Environment=GRAYLOG_HTTP_BIND_ADDRESS=0.0.0.0:9000
+Environment=GRAYLOG_HTTP_EXTERNAL_URI=${GRAYLOG_HTTP_EXTERNAL_URI}
+Environment=GRAYLOG_ROOT_USERNAME=${GRAYLOG_ROOT_USERNAME}
+Environment=GRAYLOG_ROOT_EMAIL=${GRAYLOG_ROOT_EMAIL}
+Environment=GRAYLOG_SELFSIGNED_STARTUP=${GRAYLOG_SELFSIGNED_STARTUP}
+Environment="GRAYLOG_SERVER_JAVA_OPTS=${GRAYLOG_SERVER_JAVA_OPTS}"
+Environment=TZ=${TZ}
+Secret=graylog-stack-password-secret,type=env,target=GRAYLOG_PASSWORD_SECRET
+Secret=graylog-stack-root-password-sha2,type=env,target=GRAYLOG_ROOT_PASSWORD_SHA2
+Secret=graylog-stack-mongodb-uri,type=env,target=GRAYLOG_MONGODB_URI
+
+NoNewPrivileges=true
+DropCapability=ALL
+# The bundled JRE binary carries a cap_net_bind_service file capability
+# (unused here - web/syslog ports are all >1024). With NoNewPrivileges set,
+# the kernel refuses to exec a binary whose file capabilities would grant a
+# capability the process doesn't already hold, so it must be added back
+# explicitly even though this deployment never binds a privileged port.
+AddCapability=NET_BIND_SERVICE
+
+HealthCmd=curl -sf http://localhost:9000/api/system/lbstatus
+HealthInterval=10s
+HealthTimeout=5s
+HealthStartPeriod=240s
+HealthRetries=24
+Notify=healthy
+
+[Service]
+TimeoutStartSec=480
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target default.target

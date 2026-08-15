@@ -1,0 +1,14 @@
+# Graylog stack - dedicated internal Podman network.
+# Rendered from this template by deploy.sh (envsubst). Do not edit the
+# installed copy under /etc/containers/systemd/ directly - edit this file
+# and re-run deploy.sh.
+
+[Unit]
+Description=Graylog stack - internal network
+
+[Network]
+NetworkName=${NETWORK_NAME}
+Driver=bridge
+
+[Install]
+WantedBy=multi-user.target default.target

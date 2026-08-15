@@ -1,0 +1,14 @@
+# Environment configuration (contains/derives secrets) - never commit
+.env
+
+# Rendered Quadlet units and other generated artifacts
+/.state/
+*.rendered
+
+# Editor/OS cruft
+*.swp
+*.bak
+.DS_Store
+
+# BATS test artifacts
+tests/**/*.log

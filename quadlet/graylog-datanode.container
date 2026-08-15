@@ -1,0 +1,63 @@
+# Graylog Data Node - embedded OpenSearch, managed/secured by Graylog.
+# Rendered from this template by deploy.sh (envsubst). Do not edit the
+# installed copy under /etc/containers/systemd/ directly - edit this file
+# and re-run deploy.sh.
+#
+# Never published to the host: the OpenSearch REST (9200), transport (9300)
+# and Data Node status (8999) ports are reachable only from other
+# containers on the graylog-net network.
+#
+# TLS: certificates are provisioned automatically by the Graylog server via
+# GRAYLOG_SELFSIGNED_STARTUP (see graylog.container) - no manual preflight
+# step and no certificate files baked into this unit.
+
+[Unit]
+Description=Graylog stack - Data Node
+After=mongodb.service
+Requires=mongodb.service
+
+[Container]
+Image=${DATANODE_IMAGE}:${DATANODE_VERSION}
+ContainerName=${DATANODE_CONTAINER_NAME}
+HostName=${DATANODE_CONTAINER_NAME}
+Network=graylog.network
+
+Volume=${DATANODE_DATA_DIR}:/var/lib/graylog-datanode:Z
+
+Environment=GRAYLOG_DATANODE_NODE_ID_FILE=/var/lib/graylog-datanode/node-id
+Environment=GRAYLOG_DATANODE_OPENSEARCH_HEAP=${DATANODE_OPENSEARCH_HEAP}
+Environment=TZ=${TZ}
+Secret=graylog-stack-password-secret,type=env,target=GRAYLOG_DATANODE_PASSWORD_SECRET
+Secret=graylog-stack-mongodb-uri,type=env,target=GRAYLOG_DATANODE_MONGODB_URI
+
+Ulimit=memlock=-1:-1
+Ulimit=nofile=65536:65536
+
+NoNewPrivileges=true
+DropCapability=ALL
+# The entrypoint starts as root to fix ownership/permissions on the
+# bind-mounted data directory, then drops privileges via setpriv - it needs
+# these capabilities for that one-time step.
+AddCapability=CHOWN DAC_OVERRIDE FOWNER SETGID SETUID
+
+# graylog-datanode's image has no curl/wget. Its status API on 8999 is
+# plain HTTP until Graylog provisions TLS certificates (GRAYLOG_SELFSIGNED_STARTUP
+# on graylog.container - which itself depends on this unit's health, so this
+# check MUST succeed pre-provisioning too, or startup deadlocks), after which
+# it switches to HTTPS-only. Try plain HTTP first, fall back to TLS via
+# openssl (present in the image); any well-formed HTTP status line (including
+# 401 once auth is enforced) counts as "alive".
+HealthCmd=bash -c '(exec 3<>/dev/tcp/127.0.0.1/8999 && printf "GET / HTTP/1.0\r\n\r\n" >&3 && head -1 <&3 | grep -qE "^HTTP/1\.[01] [0-9]{3}") || (printf "GET / HTTP/1.0\r\n\r\n" | timeout 5 openssl s_client -connect 127.0.0.1:8999 -quiet 2>/dev/null | grep -qE "^HTTP/1\.[01] [0-9]{3}")'
+HealthInterval=10s
+HealthTimeout=5s
+HealthStartPeriod=180s
+HealthRetries=18
+Notify=healthy
+
+[Service]
+TimeoutStartSec=400
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target default.target
