@@ -110,6 +110,42 @@ check_bind_mount "${MONGODB_DB_DIR}" 999 999
 check_bind_mount "${MONGODB_CONFIGDB_DIR}" 999 999
 check_bind_mount "${DATANODE_DATA_DIR}" 999 999
 check_bind_mount "${GRAYLOG_DATA_DIR}" 1100 1100
+check_bind_mount "${GRAYLOG_TLS_DIR}" 0 1100
+
+# --- TLS certificate (web UI / API, and the TLS syslog input if enabled) ----
+TLS_CERT="${GRAYLOG_TLS_DIR}/cert.pem"
+TLS_KEY="${GRAYLOG_TLS_DIR}/key.pem"
+TLS_TRUSTSTORE="${GRAYLOG_TLS_DIR}/cacerts.jks"
+if [[ -s "${TLS_CERT}" && -s "${TLS_KEY}" && -s "${TLS_TRUSTSTORE}" ]]; then
+  pass "TLS certificate, key and JVM trust store present"
+  if cert_days_left="$(tls_cert_days_left "${TLS_CERT}" 2>/dev/null)"; then
+    cert_not_after="$(openssl x509 -in "${TLS_CERT}" -noout -enddate | cut -d= -f2)"
+    if (( cert_days_left <= 0 )); then
+      fail "TLS certificate expired (${cert_not_after})"
+    elif (( cert_days_left < 30 )); then
+      warn "TLS certificate expires in ${cert_days_left} days (${cert_not_after})"
+    else
+      pass "TLS certificate valid for ${cert_days_left} more days (until ${cert_not_after})"
+    fi
+  else
+    fail "TLS certificate ${TLS_CERT} could not be read"
+  fi
+  check "TLS key matches the certificate" true tls_key_matches_cert "${TLS_CERT}" "${TLS_KEY}"
+  external_host="$(uri_host "${GRAYLOG_HTTP_EXTERNAL_URI}")"
+  check "TLS certificate covers ${external_host} (GRAYLOG_HTTP_EXTERNAL_URI)" true tls_cert_covers_host "${TLS_CERT}" "${external_host}"
+  for tls_file in "${TLS_KEY}" "${TLS_TRUSTSTORE}"; do
+    tls_file_state="$(stat -c '%u:%g %a' "${tls_file}")"
+    if [[ "${tls_file_state}" == "0:1100 640" ]]; then
+      pass "ownership/mode correct: ${tls_file} (0:1100 640)"
+    else
+      fail "ownership/mode of ${tls_file} is ${tls_file_state}, expected 0:1100 640"
+    fi
+  done
+  check "Graylog container user can read its TLS key and trust store" true \
+    podman exec "${GRAYLOG_CONTAINER_NAME}" sh -c "test -r ${GRAYLOG_TLS_CONTAINER_DIR}/key.pem && test -r ${GRAYLOG_TLS_CONTAINER_DIR}/cacerts.jks"
+else
+  fail "TLS certificate, key and JVM trust store present under ${GRAYLOG_TLS_DIR} (run deploy.sh)"
+fi
 
 # --- SELinux enforcing + AVC denials ---------------------------------------
 if [[ "$(getenforce)" == "Enforcing" ]]; then
@@ -120,7 +156,9 @@ fi
 
 avc_hits=""
 if command -v ausearch >/dev/null 2>&1; then
-  avc_hits="$(ausearch -m avc -ts recent 2>/dev/null | grep -Ei "${DATA_ROOT}|${MONGODB_CONTAINER_NAME}|${DATANODE_CONTAINER_NAME}|${GRAYLOG_CONTAINER_NAME}" || true)"
+  # --input-logs: without it ausearch reads stdin whenever stdin is a pipe
+  # (ssh, cron, CI) and hangs forever waiting for input.
+  avc_hits="$(ausearch --input-logs -m avc -ts recent 2>/dev/null </dev/null | grep -Ei "${DATA_ROOT}|${MONGODB_CONTAINER_NAME}|${DATANODE_CONTAINER_NAME}|${GRAYLOG_CONTAINER_NAME}" || true)"
 else
   avc_hits="$(journalctl -k --since '10 min ago' 2>/dev/null | grep -i 'avc:.*denied' | grep -Ei "${DATA_ROOT}|container_t" || true)"
 fi
@@ -131,14 +169,22 @@ else
 fi
 
 # --- disk capacity -----------------------------------------------------------
-disk_use_pct="$(df -P "${DATA_ROOT}" | awk 'NR==2{gsub("%","",$5); print $5}')"
-if [[ "${disk_use_pct}" -ge 95 ]]; then
-  fail "disk usage under ${DATA_ROOT} is ${disk_use_pct}% (critical)"
-elif [[ "${disk_use_pct}" -ge 85 ]]; then
-  warn "disk usage under ${DATA_ROOT} is ${disk_use_pct}% (getting full)"
-else
-  pass "disk usage under ${DATA_ROOT} is ${disk_use_pct}%"
-fi
+# Each bind mount may be its own filesystem (see README "Partition sizing"),
+# so check every distinct filesystem behind them, once each.
+declare -A disk_seen=()
+for disk_path in "${DATA_ROOT}" "${DATANODE_DATA_DIR}" "${GRAYLOG_DATA_DIR}" "${MONGODB_DB_DIR}" "${MONGODB_CONFIGDB_DIR}"; do
+  [[ -d "${disk_path}" ]] || continue
+  read -r disk_mount disk_use_pct < <(df -P "${disk_path}" | awk 'NR==2{gsub("%","",$5); print $6, $5}')
+  [[ -z "${disk_seen[${disk_mount}]:-}" ]] || continue
+  disk_seen["${disk_mount}"]=1
+  if [[ "${disk_use_pct}" -ge 95 ]]; then
+    fail "disk usage on ${disk_mount} (holds ${disk_path}) is ${disk_use_pct}% (critical)"
+  elif [[ "${disk_use_pct}" -ge 85 ]]; then
+    warn "disk usage on ${disk_mount} (holds ${disk_path}) is ${disk_use_pct}% (getting full)"
+  else
+    pass "disk usage on ${disk_mount} (holds ${disk_path}) is ${disk_use_pct}%"
+  fi
+done
 
 # --- MongoDB / Data Node / Graylog readiness (podman healthcheck already
 #     covers this; add a direct network-level confirmation too) -----------
@@ -146,11 +192,29 @@ check "MongoDB port reachable in-network" true podman exec "${MONGODB_CONTAINER_
 check "Data Node status endpoint reachable" true podman exec "${DATANODE_CONTAINER_NAME}" bash -c '(exec 3<>/dev/tcp/127.0.0.1/8999 && printf "GET / HTTP/1.0\r\n\r\n" >&3 && head -1 <&3 | grep -qE "^HTTP/1\.[01] [0-9]{3}") || (printf "GET / HTTP/1.0\r\n\r\n" | timeout 5 openssl s_client -connect 127.0.0.1:8999 -quiet 2>/dev/null | grep -qE "^HTTP/1\.[01] [0-9]{3}")'
 
 # --- Graylog HTTP/API -----------------------------------------------------
-check "Graylog HTTP/API reachable (lbstatus)" true curl -fsS -m 5 "http://127.0.0.1:${GRAYLOG_HTTP_PORT}/api/system/lbstatus"
+check "Graylog HTTPS/API reachable and certificate verifies (lbstatus)" true curl -fsS -m 5 --cacert "${TLS_CERT}" "https://127.0.0.1:${GRAYLOG_HTTP_PORT}/api/system/lbstatus"
+if curl -fsS -m 5 "http://127.0.0.1:${GRAYLOG_HTTP_PORT}/api/system/lbstatus" >/dev/null 2>&1; then
+  fail "Graylog answers plain HTTP on ${GRAYLOG_HTTP_PORT} (expected TLS only)"
+else
+  pass "Graylog does not answer plain HTTP on ${GRAYLOG_HTTP_PORT}"
+fi
+
+# --- allowed-source filter ---------------------------------------------------
+if [[ "${MANAGE_FIREWALL}" == "true" && -n "${FIREWALL_ALLOWED_SOURCES//[[:space:],]/}" ]]; then
+  check "allowed-source filter loaded (FIREWALL_ALLOWED_SOURCES=${FIREWALL_ALLOWED_SOURCES})" true nft list table inet graylog_stack
+  check "allowed-source filter enabled at boot" true systemctl is-enabled --quiet "${SOURCE_FILTER_UNIT_NAME}"
+elif nft list table inet graylog_stack >/dev/null 2>&1; then
+  fail "allowed-source filter is loaded but FIREWALL_ALLOWED_SOURCES is empty (rerun deploy.sh)"
+fi
 
 # --- Syslog ports listening -------------------------------------------------
 check "Syslog TCP :${SYSLOG_TCP_PORT} listening" true bash -c "ss -Htln 'sport = :${SYSLOG_TCP_PORT}' | grep -q ."
 check "Syslog UDP :${SYSLOG_UDP_PORT} listening" true bash -c "ss -Huln 'sport = :${SYSLOG_UDP_PORT}' | grep -q ."
+if [[ "${SYSLOG_TLS_ENABLED}" == "true" ]]; then
+  check "Syslog TLS :${SYSLOG_TLS_PORT} listening" true bash -c "ss -Htln 'sport = :${SYSLOG_TLS_PORT}' | grep -q ."
+  check "Syslog TLS :${SYSLOG_TLS_PORT} presents the deployment certificate" true \
+    bash -c "timeout 5 openssl s_client -connect 127.0.0.1:${SYSLOG_TLS_PORT} -CAfile '${TLS_CERT}' -verify_return_error </dev/null"
+fi
 
 # --- End-to-end syslog ingestion test ---------------------------------------
 e2e_ingest_test() {
@@ -165,29 +229,57 @@ e2e_ingest_test() {
   GRAYLOG_API_USER="$(cat "${token_file}")"
   GRAYLOG_API_PASS="token"
 
+  if ! graylog_token_valid "${GRAYLOG_API_USER}"; then
+    fail "stored API token is rejected by Graylog (expired or revoked) - rerun deploy.sh to mint a new one"
+    return
+  fi
+
   if ! command -v logger >/dev/null 2>&1; then
     warn "end-to-end syslog ingestion test skipped (logger command not available)"
     return
   fi
 
-  local marker tcp_ok=0 udp_ok=0
+  # Drift between SYSLOG_TLS_ENABLED and what Graylog actually has configured.
+  local tls_input_state
+  if tls_input_state="$(graylog_input_tls_state "${SYSLOG_TLS_INPUT_TITLE}" 2>/dev/null)"; then
+    if [[ "${SYSLOG_TLS_ENABLED}" == "true" ]]; then
+      if [[ "${tls_input_state}" == "tls" ]]; then pass "TLS syslog input configured with TLS enabled"; else fail "SYSLOG_TLS_ENABLED=true but the '${SYSLOG_TLS_INPUT_TITLE}' input is ${tls_input_state} (rerun deploy.sh)"; fi
+    else
+      if [[ "${tls_input_state}" == "absent" ]]; then pass "no TLS syslog input configured (SYSLOG_TLS_ENABLED=false)"; else fail "SYSLOG_TLS_ENABLED=false but a '${SYSLOG_TLS_INPUT_TITLE}' input still exists (rerun deploy.sh)"; fi
+    fi
+  else
+    fail "could not query Graylog inputs via the API"
+  fi
+
+  local marker tcp_ok=0 udp_ok=0 tls_ok=0
   marker="healthcheck-$(date +%s)-$$"
 
   logger -n 127.0.0.1 -P "${SYSLOG_TCP_PORT}" -T -t healthcheck "${marker}-tcp" 2>/dev/null || true
   logger -n 127.0.0.1 -P "${SYSLOG_UDP_PORT}" -d -t healthcheck "${marker}-udp" 2>/dev/null || true
+  if [[ "${SYSLOG_TLS_ENABLED}" == "true" ]]; then
+    # s_client -quiet keeps the connection open after stdin ends, so bound it.
+    printf '<14>%s %s healthcheck: %s-tls\n' "$(date '+%b %e %H:%M:%S')" "$(hostname -s)" "${marker}" \
+      | timeout 5 openssl s_client -connect "127.0.0.1:${SYSLOG_TLS_PORT}" -CAfile "${TLS_CERT}" -verify_return_error -quiet >/dev/null 2>&1 || true
+  else
+    tls_ok=1 # not applicable
+  fi
 
   local waited=0 found=""
   while (( waited < 30 )); do
     found="$(graylog_curl GET "/search/universal/relative?query=${marker}&range=60&limit=10" 2>/dev/null || true)"
     if printf '%s' "${found}" | grep -q "${marker}-tcp"; then tcp_ok=1; fi
     if printf '%s' "${found}" | grep -q "${marker}-udp"; then udp_ok=1; fi
-    if [[ ${tcp_ok} -eq 1 && ${udp_ok} -eq 1 ]]; then break; fi
+    if printf '%s' "${found}" | grep -q "${marker}-tls"; then tls_ok=1; fi
+    if [[ ${tcp_ok} -eq 1 && ${udp_ok} -eq 1 && ${tls_ok} -eq 1 ]]; then break; fi
     sleep 3
     waited=$(( waited + 3 ))
   done
 
   if [[ ${tcp_ok} -eq 1 ]]; then pass "end-to-end syslog TCP ingestion verified"; else fail "end-to-end syslog TCP ingestion (test message not found in index within 30s)"; fi
   if [[ ${udp_ok} -eq 1 ]]; then pass "end-to-end syslog UDP ingestion verified"; else fail "end-to-end syslog UDP ingestion (test message not found in index within 30s)"; fi
+  if [[ "${SYSLOG_TLS_ENABLED}" == "true" ]]; then
+    if [[ ${tls_ok} -eq 1 ]]; then pass "end-to-end syslog TLS ingestion verified"; else fail "end-to-end syslog TLS ingestion (test message not found in index within 30s)"; fi
+  fi
 }
 e2e_ingest_test
 

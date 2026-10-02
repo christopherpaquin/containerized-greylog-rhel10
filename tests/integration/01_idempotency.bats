@@ -37,7 +37,7 @@ setup() {
   podman secret ls --format '{{.Name}}' | sort > /tmp/graylog-stack-test-secrets-list-before.txt
   local token
   token="$(cat "${SECRETS_DIR}/api_token")"
-  curl -fsS -u "${token}:token" "http://127.0.0.1:${GRAYLOG_HTTP_PORT}/api/system/inputs" \
+  curl -fsS --cacert "${GRAYLOG_TLS_DIR:-${DATA_ROOT}/tls}/cert.pem" -u "${token}:token" "https://127.0.0.1:${GRAYLOG_HTTP_PORT}/api/system/inputs" \
     > /tmp/graylog-stack-test-inputs-before.json
 }
 
@@ -78,7 +78,7 @@ setup() {
   local token before_count after_count
   token="$(cat "${SECRETS_DIR}/api_token")"
   before_count="$(python3 -c "import json;print(json.load(open('/tmp/graylog-stack-test-inputs-before.json'))['total'])")"
-  after_count="$(curl -fsS -u "${token}:token" "http://127.0.0.1:${GRAYLOG_HTTP_PORT}/api/system/inputs" | python3 -c "import json,sys;print(json.load(sys.stdin)['total'])")"
+  after_count="$(curl -fsS --cacert "${GRAYLOG_TLS_DIR:-${DATA_ROOT}/tls}/cert.pem" -u "${token}:token" "https://127.0.0.1:${GRAYLOG_HTTP_PORT}/api/system/inputs" | python3 -c "import json,sys;print(json.load(sys.stdin)['total'])")"
   [ "${before_count}" -eq "${after_count}" ]
 }
 

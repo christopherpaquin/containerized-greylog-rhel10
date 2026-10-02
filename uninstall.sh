@@ -109,9 +109,24 @@ else
 fi
 
 log_step "Removing firewalld rules created by this deployment"
-if [[ -n "${bridge_iface}" ]]; then
-  firewall-cmd --permanent --zone=trusted --remove-interface="${bridge_iface}" >/dev/null 2>&1 || true
-  log_info "Removed trusted-zone binding for ${bridge_iface}"
+firewall_source_filter_remove
+# Only undo a trusted-zone binding deploy.sh recorded having made itself.
+if [[ -s "${MANIFEST_FILE}.firewall_trusted_iface" ]]; then
+  trusted_iface="$(cat "${MANIFEST_FILE}.firewall_trusted_iface")"
+  firewall-cmd --permanent --zone=trusted --remove-interface="${trusted_iface}" >/dev/null 2>&1 || true
+  log_info "Removed trusted-zone binding for ${trusted_iface}"
+elif [[ -n "${bridge_iface}" ]]; then
+  log_info "Leaving trusted-zone binding for ${bridge_iface} in place (not created by deploy.sh)"
+fi
+if [[ -f "${MANIFEST_FILE}.firewall_rules" ]]; then
+  while IFS= read -r entry; do
+    [[ -n "${entry}" ]] || continue
+    if firewall_entry_remove "${entry}"; then
+      log_info "Removed ${entry//|/ }"
+    else
+      log_warn "Could not remove firewalld rule: ${entry//|/ }"
+    fi
+  done < "${MANIFEST_FILE}.firewall_rules"
 fi
 if [[ -f "${MANIFEST_FILE}.firewall_ports_added" ]]; then
   while IFS= read -r p; do
@@ -122,8 +137,8 @@ if [[ -f "${MANIFEST_FILE}.firewall_ports_added" ]]; then
 fi
 firewall_reload || true
 
-log_step "Removing persistent kernel/resource-limit configuration"
-for f in "${SYSCTL_DROPIN}" "${LIMITS_DROPIN}"; do
+log_step "Removing persistent kernel/resource-limit configuration and login banner"
+for f in "${SYSCTL_DROPIN}" "${LIMITS_DROPIN}" "${MOTD_FILE}"; do
   if [[ -f "${f}" ]]; then
     rm -f "${f}"
     log_ok "Removed ${f}"
@@ -138,24 +153,36 @@ if [[ -n "${DATA_ROOT:-}" ]]; then
 fi
 
 log_step "Removing deployment manifest"
-rm -f "${MANIFEST_FILE}" "${MANIFEST_FILE}.packages_installed" "${MANIFEST_FILE}.firewall_ports_added"
-
-if [[ -f "${MANIFEST_FILE}.packages_installed" ]]; then
+if [[ -s "${MANIFEST_FILE}.packages_installed" ]]; then
   log_info "Packages installed by deploy.sh (not removed - shared system state): $(sort -u "${MANIFEST_FILE}.packages_installed" | xargs)"
 fi
+rm -f "${MANIFEST_FILE}" "${MANIFEST_FILE}.packages_installed" "${MANIFEST_FILE}.firewall_ports_added" "${MANIFEST_FILE}.firewall_rules" "${MANIFEST_FILE}.firewall_trusted_iface"
 
 if [[ "${PURGE_DATA}" == "true" ]]; then
   log_step "Purging persistent data and secrets"
   for name in graylog-stack-password-secret graylog-stack-root-password-sha2 graylog-stack-mongo-root-password graylog-stack-mongodb-uri; do
     podman_secret_rm_if_exists "${name}"
   done
+  # The generated credentials in .env are useless once the data they
+  # belong to is gone - and a leftover admin password hash whose plaintext
+  # was just deleted would lock the next deploy out of its own API. Blank
+  # them so the next deploy generates a fresh set. A hash the operator set
+  # by hand (no generated admin_password.txt) is kept.
+  if [[ -f "${ENV_FILE}" ]]; then
+    persist_env_var GRAYLOG_PASSWORD_SECRET ""
+    persist_env_var MONGO_INITDB_ROOT_PASSWORD ""
+    if [[ -f "${SECRETS_DIR}/admin_password.txt" ]]; then
+      persist_env_var GRAYLOG_ROOT_PASSWORD_SHA2 ""
+    fi
+    log_ok "Cleared generated credentials from ${ENV_FILE}"
+  fi
   if [[ -n "${DATA_ROOT:-}" && -d "${DATA_ROOT}" ]]; then
     rm -rf "${DATA_ROOT}"
     log_ok "Removed ${DATA_ROOT} (all data and secrets)"
   fi
 else
   log_step "Preserving persistent data"
-  log_info "Left in place: ${DATA_ROOT}/{mongodb,datanode,graylog,secrets} (rerun with --purge-data to delete)"
+  log_info "Left in place: ${DATA_ROOT}/{mongodb,datanode,graylog,secrets,tls} (rerun with --purge-data to delete)"
 fi
 
 echo

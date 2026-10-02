@@ -79,7 +79,7 @@ write_valid_env() {
   write_valid_env
   load_env
   persist_env_var NETWORK_NAME "custom-net"
-  grep -q '^NETWORK_NAME=custom-net$' "${ENV_FILE}"
+  grep -q '^NETWORK_NAME="custom-net"$' "${ENV_FILE}"
   [ "${NETWORK_NAME}" = "custom-net" ]
 }
 
@@ -87,7 +87,7 @@ write_valid_env() {
   write_valid_env
   load_env
   persist_env_var BRAND_NEW_KEY "hello"
-  grep -q '^BRAND_NEW_KEY=hello$' "${ENV_FILE}"
+  grep -q '^BRAND_NEW_KEY="hello"$' "${ENV_FILE}"
 }
 
 @test "persist_env_var is idempotent (rerun does not duplicate the key)" {
@@ -97,4 +97,53 @@ write_valid_env() {
   persist_env_var NETWORK_NAME "custom-net"
   count="$(grep -c '^NETWORK_NAME=' "${ENV_FILE}")"
   [ "${count}" -eq 1 ]
+}
+
+@test "persist_env_var value with spaces survives a reload of .env" {
+  write_valid_env
+  load_env
+  persist_env_var GRAYLOG_SERVER_JAVA_OPTS "-Xms1g -Xmx1g"
+  unset GRAYLOG_SERVER_JAVA_OPTS
+  load_env
+  [ "${GRAYLOG_SERVER_JAVA_OPTS}" = "-Xms1g -Xmx1g" ]
+}
+
+@test "persist_env_var round-trips shell and sed metacharacters unchanged" {
+  write_valid_env
+  load_env
+  local tricky='a|b&c\d"e$HOME`id`/f g'
+  persist_env_var NETWORK_NAME "${tricky}"
+  unset NETWORK_NAME
+  load_env
+  [ "${NETWORK_NAME}" = "${tricky}" ]
+}
+
+@test "persist_env_var keeps .env mode when updating a key" {
+  write_valid_env
+  chmod 600 "${ENV_FILE}"
+  load_env
+  persist_env_var NETWORK_NAME "custom-net"
+  [ "$(stat -c '%a' "${ENV_FILE}")" = "600" ]
+  ! ls "${ENV_FILE}".?* >/dev/null 2>&1
+}
+
+@test "admin_notes shows URL, health check, stop/start commands and no secrets" {
+  write_valid_env
+  load_env
+  GRAYLOG_HTTP_EXTERNAL_URI="https://10.1.2.3:9000/"
+  MONGO_INITDB_ROOT_PASSWORD="s3cretvalue"
+  GRAYLOG_PASSWORD_SECRET="peppervalue"
+  run admin_notes
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"https://10.1.2.3:9000/"* ]]
+  [[ "$output" == *"${REPO_ROOT}/healthcheck.sh"* ]]
+  [[ "$output" == *"systemctl stop graylog graylog-datanode mongodb"* ]]
+  [[ "$output" == *"systemctl start graylog"* ]]
+  [[ "$output" == *"journalctl -u graylog"* ]]
+  [[ "$output" != *"s3cretvalue"* ]]
+  [[ "$output" != *"peppervalue"* ]]
+  [[ "$output" != *"(TLS)"* ]]
+  SYSLOG_TLS_ENABLED=true
+  run admin_notes
+  [[ "$output" == *"6514/tcp (TLS)"* ]]
 }

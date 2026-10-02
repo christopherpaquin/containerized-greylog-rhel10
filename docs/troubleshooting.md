@@ -36,10 +36,36 @@ Look for `"security configuration is missing"` (normal, pre-provisioning - waiti
 ## Graylog API unreachable
 
 ```bash
-curl -v http://127.0.0.1:9000/api/system/lbstatus
+sudo curl -v --cacert /var/lib/graylog-stack/tls/cert.pem https://127.0.0.1:9000/api/system/lbstatus
 sudo ss -tlnp | grep 9000
-sudo firewall-cmd --list-ports
+sudo firewall-cmd --get-active-zones
+sudo firewall-cmd --zone=<zone> --list-all
 ```
+
+## TLS / certificate problems
+
+```bash
+sudo openssl x509 -in /var/lib/graylog-stack/tls/cert.pem -noout -subject -enddate -ext subjectAltName
+```
+
+* **`deploy.sh` stops with "does not cover '<host>'"** - the host in `GRAYLOG_HTTP_EXTERNAL_URI` isn't one of the certificate's names. Delete `cert.pem` and `key.pem` under `/var/lib/graylog-stack/tls/` and rerun `sudo ./deploy.sh`; add further names with `GRAYLOG_TLS_EXTRA_SANS` first if clients use them.
+* **Browser warning** - expected for a self-signed certificate until the client trusts `cert.pem`. Apple clients additionally reject certificates valid for more than 825 days.
+* **Graylog UI shows errors loading node/cluster information, or `PKIX path building failed` in `podman logs graylog`** - Graylog could not verify its own API. Check that `/var/lib/graylog-stack/tls/cacerts.jks` exists and is `root:1100 0640`; delete it and `cacerts.stamp`, then rerun `sudo ./deploy.sh` to rebuild it.
+* **`Could not build the JVM trust store`** - `keytool` could not be run from the Graylog image; the preceding output shows why (image missing, or a different Java layout in a newer image).
+* **Certificate expired / about to expire** - delete `cert.pem` and `key.pem` and rerun `sudo ./deploy.sh`, then redistribute the new `cert.pem` to clients.
+* **`SYSLOG_TLS_ENABLED=true but the 'Syslog TCP (TLS)' input could not be created with TLS enabled`** - an input of that title already exists without TLS, or Graylog rejected the configuration. Delete the input under System → Inputs and rerun; `podman logs graylog` has the reason.
+
+## A client cannot connect although the port is "open"
+
+If `FIREWALL_ALLOWED_SOURCES` is set, anything not on the list is dropped silently (connections time out rather than being refused):
+
+```bash
+grep FIREWALL_ALLOWED_SOURCES .env
+sudo nft list table inet graylog_stack                     # the rules actually in force
+sudo systemctl status graylog-stack-source-filter.service
+```
+
+Add the client's address or network to the list and rerun `sudo ./deploy.sh`. To rule the filter out temporarily: `sudo systemctl stop graylog-stack-source-filter.service` (start it again afterwards). Note that `firewall-cmd --list-all` is not the whole story for these ports - see the Firewall section of the README.
 
 ## SELinux denials
 
@@ -73,9 +99,9 @@ Or simply rerun `sudo ./deploy.sh` - it checks and reapplies this on every run.
 
 ## No syslog messages arriving
 
-1. Confirm the input exists and is running: Graylog UI → System → Inputs, or `curl -u <token>:token http://127.0.0.1:9000/api/system/inputs`.
+1. Confirm the input exists and is running: Graylog UI → System → Inputs, or `sudo curl --cacert /var/lib/graylog-stack/tls/cert.pem -u <token>:token https://127.0.0.1:9000/api/system/inputs`.
 2. Confirm the port is actually listening: `sudo ss -tlnp | grep 1514` (TCP) / `sudo ss -ulnp | grep 1514` (UDP).
-3. Confirm firewalld allows it: `sudo firewall-cmd --list-ports`.
+3. Confirm firewalld allows it: `sudo firewall-cmd --get-active-zones`, then `sudo firewall-cmd --zone=<zone> --list-all` (ports appear under `ports:`, or under `rich rules:` when `FIREWALL_ALLOWED_SOURCES` is set - in which case check the sender's address is in the list).
 4. Test locally first (bypasses network/firewall entirely): `logger -n 127.0.0.1 -P 1514 -T -t test "hello"`.
 5. Check Graylog's own logs for parse errors: `sudo podman logs graylog | grep -i syslog`.
 

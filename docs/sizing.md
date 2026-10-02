@@ -16,7 +16,7 @@ Both heaps together are intentionally well under 100% of RAM, leaving headroom f
 ## Before increasing retention or ingest volume
 
 * **OpenSearch heap**: if Graylog's own "Data Node Heap Size Warning" reappears after a rerun (e.g. because you'd previously pinned a small value), clear `DATANODE_OPENSEARCH_HEAP` back to blank and rerun `./deploy.sh` to re-detect, or set it explicitly.
-* **Disk**: index data grows with retention × ingest rate. Monitor `df -h /var/lib/graylog-stack` - `healthcheck.sh` warns at 85% and fails at 95% disk usage under `DATA_ROOT`.
+* **Disk**: index data grows with retention × ingest rate - see "Partition sizing for the bind mounts" in the [README](../README.md#partition-sizing-for-the-bind-mounts) for per-directory sizes and the formula. `healthcheck.sh` warns at 85% and fails at 95% on each filesystem holding a bind mount.
 * **vCPU**: OpenSearch indexing/search and Graylog message processing both benefit from more cores under sustained load; 4 is a reasonable floor, not a ceiling.
 
 ## Changing heap sizes manually

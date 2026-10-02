@@ -10,7 +10,7 @@ Each stage is gated on a real Podman health check, not a fixed `sleep`. The Quad
 
 * `mongodb.service` - `HealthCmd` runs `mongosh ... db.adminCommand('ping')` with the real credentials.
 * `graylog-datanode.service` - see "TLS" below; the health check has to work in *both* the pre-TLS and post-TLS state, because Graylog (which provisions the TLS cert) itself depends on Data Node being healthy first.
-* `graylog.service` - `HealthCmd` hits `/api/system/lbstatus`, Graylog's unauthenticated load-balancer status endpoint.
+* `graylog.service` - `HealthCmd` hits `/api/system/lbstatus` over HTTPS (verifying the deployment's certificate), Graylog's unauthenticated load-balancer status endpoint.
 
 ## Container user model
 
@@ -28,6 +28,31 @@ Graylog's bundled JRE binary carries a `cap_net_bind_service` file capability (f
 
 ## TLS / certificate provisioning
 
+There are two independent sets of certificates: the web UI/API certificate that `deploy.sh` generates, and the Data Node certificates that Graylog issues itself.
+
+### Web UI / API
+
+`deploy.sh` (`step_tls`) generates a self-signed RSA-4096 certificate and an unencrypted PKCS#8 key (the only key format Graylog accepts) with `openssl`, once, into `GRAYLOG_TLS_DIR` (default `/var/lib/graylog-stack/tls`). The lifetime is `GRAYLOG_TLS_CERT_DAYS` (default 3650 - 10 years), and generation fails rather than installing a certificate that isn't valid for that long.
+
+| File | Owner / mode | Purpose |
+|---|---|---|
+| `cert.pem` | `root:1100` `0644` | Certificate (safe to hand to clients) |
+| `key.pem` | `root:1100` `0640` | Private key |
+| `cacerts.jks` | `root:1100` `0640` | JVM trust store: the image's CA bundle plus `cert.pem` |
+| `cacerts.stamp` | `root` `0644` | Image tag + certificate fingerprint the trust store was built from |
+
+The directory is bind mounted read-only at `/etc/graylog-tls` in the Graylog container, which runs with `GRAYLOG_HTTP_ENABLE_TLS=true` and the cert/key paths above. Port 9000 then speaks HTTPS only.
+
+**Why a trust store:** Graylog calls its own REST API (at `http_publish_uri`, here `https://graylog:9000/`) for cluster-wide endpoints, and it verifies that connection with the JVM's default trust store - which rejects a self-signed certificate. `deploy.sh` therefore runs `keytool` from the pinned Graylog image (no network, no volume: certificate in on stdin, trust store out on stdout) to produce `cacerts.jks`, and the unit appends `-Djavax.net.ssl.trustStore=/etc/graylog-tls/cacerts.jks` to the JVM options. Those flags live in the Quadlet template, not in `.env`, and `deploy.sh` rejects a `GRAYLOG_SERVER_JAVA_OPTS` that sets its own trust store. The trust store is rebuilt when the certificate or the Graylog image version changes, and that forces a `graylog.service` restart.
+
+**Names on the certificate:** `localhost`, `127.0.0.1` (the deploy/healthcheck scripts and the container health check use these), the Graylog container name (the publish URI), the host in `GRAYLOG_HTTP_EXTERNAL_URI`, the machine's short and fully-qualified hostname, and `GRAYLOG_TLS_EXTRA_SANS`. Because reruns never rotate the certificate, `deploy.sh` stops with instructions if the external URI's host is not covered.
+
+### Optional TLS syslog input
+
+With `SYSLOG_TLS_ENABLED=true`, `deploy.sh` publishes `SYSLOG_TLS_PORT` (default 6514) to container port 6514 and creates a third syslog TCP input, "Syslog TCP (TLS)", with `tls_enable` set and the same `cert.pem`/`key.pem`. It then reads the input back from the API and fails the deploy unless Graylog reports it as TLS-enabled. Client certificates are not required. With `false` (the default), any input of that title is deleted and the port is not published; `healthcheck.sh` fails if the setting and the configured input disagree.
+
+### Data Node
+
 Data Node needs TLS certificates for OpenSearch's HTTP/transport layers and its own status API. Graylog's `GRAYLOG_SELFSIGNED_STARTUP=true` (Graylog 6.2+) fully automates this: on first start, the Graylog server generates a self-signed CA, and MongoDB-mediated discovery pushes provisioning to Data Node automatically - no interactive preflight wizard, no manually-generated certs.
 
 This creates a real ordering subtlety: Data Node's status API on port 8999 serves **plain HTTP before provisioning** and **HTTPS-only after** (once Graylog has issued its certificate). Since Graylog itself depends on Data Node being healthy before it can start (and therefore before it can provision Data Node's certs), Data Node's health check tries plain HTTP first and falls back to a TLS probe via `openssl s_client` (the image has no curl/wget, only bash + openssl):
@@ -43,7 +68,7 @@ The default renewal policy is a 30-day automatic rotation. `deploy.sh` sets `cer
 
 ## API automation identity
 
-Graylog's built-in root user (`GRAYLOG_ROOT_USERNAME`, default `admin`) is a synthetic account with no real MongoDB-backed user ID - the personal access token API (`POST /api/users/{userId}/tokens/{name}`) requires a real 24-character hex user ID, which the root account doesn't have. `deploy.sh` therefore provisions a dedicated `graylog-stack-automation` user (Admin role) on first run using the one-time plaintext admin password, mints a token for *that* user, and stores the token (not the password) for all future runs. Token values are only ever returned at creation time - if the stored token is lost, `deploy.sh` mints a new one (using the admin password if still available) rather than trying to recover the old value.
+Graylog's built-in root user (`GRAYLOG_ROOT_USERNAME`, default `admin`) is a synthetic account with no real MongoDB-backed user ID - the personal access token API (`POST /api/users/{userId}/tokens/{name}`) requires a real 24-character hex user ID, which the root account doesn't have. `deploy.sh` therefore provisions a dedicated `graylog-stack-automation` user (Admin role) on first run using the one-time plaintext admin password, mints a token for *that* user, and stores the token (not the password) for all future runs. The token is created with an explicit lifetime (`GRAYLOG_API_TOKEN_TTL`, default 10 years) because Graylog otherwise expires access tokens after 30 days; `deploy.sh` checks the stored token on every run and mints a replacement if Graylog rejects it. Token values are only ever returned at creation time - if the stored token is lost, `deploy.sh` mints a new one (using the admin password if still available) rather than trying to recover the old value.
 
 ## Why not a separate OpenSearch container
 

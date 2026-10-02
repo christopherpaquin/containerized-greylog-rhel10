@@ -9,6 +9,8 @@ Every host directory bind-mounted into a container gets:
 1. A **persistent fcontext rule**, applied via `semanage fcontext -a -t container_file_t "<path>(/.*)?"` and `restorecon -Rv <path>` (`scripts/lib.sh:selinux_label_path`). This survives across reboots and `restorecon` runs triggered by anything else on the system - unlike Podman's own `:Z`/`:z` volume-suffix relabeling, which is applied by Podman at container start but isn't recorded as a persistent policy rule.
 2. The `:Z` suffix on the `Volume=` line in each Quadlet unit, so Podman also relabels the mount at container start (belt-and-suspenders with #1). `:Z` (not `:z`) is used because each host directory is bind-mounted into exactly one container - none of them are shared between containers, so a private (non-shared) label is correct.
 
+The TLS directory (`/var/lib/graylog-stack/tls`) is covered by the same rule and is mounted `:ro,Z` into the Graylog container only.
+
 `uninstall.sh` removes exactly the fcontext rule this deployment added (`semanage fcontext -d`), and nothing else.
 
 ## Why not just `:Z` alone

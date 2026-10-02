@@ -7,7 +7,8 @@ Not automated by this repo - this documents a suggested approach.
 1. **`.env`** - contains generated secrets. Without it (and without a MongoDB backup), the admin password can still be reset (see [troubleshooting.md](troubleshooting.md)), but the Data Node/Graylog password secret (`GRAYLOG_PASSWORD_SECRET`) cannot - losing it invalidates all existing user sessions and any values encrypted with it.
 2. **MongoDB** (`/var/lib/graylog-stack/mongodb`) - cluster configuration, users, roles, streams, dashboards, alert definitions, input definitions. Small, changes infrequently, cheap to back up often.
 3. **Data Node** (`/var/lib/graylog-stack/datanode`) - the actual log index data. Largest and fastest-growing directory; back up per your retention/compliance requirements.
-4. **Graylog** (`/var/lib/graylog-stack/graylog`) - node ID (matters for cluster identity) and journal (transient in-flight messages - not critical to back up).
+4. **TLS** (`/var/lib/graylog-stack/tls`) - the web UI/API certificate and key. Tiny; restoring it avoids re-distributing a new certificate to every client that trusts the old one. Ownership is `root:1100` (`deploy.sh` re-asserts it).
+5. **Graylog** (`/var/lib/graylog-stack/graylog`) - node ID (matters for cluster identity) and journal (transient in-flight messages - not critical to back up).
 
 ## Consistent backups
 

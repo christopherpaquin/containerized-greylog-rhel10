@@ -12,7 +12,10 @@
 # bash exemption), which is what keeps deploy.sh's diagnostics from firing
 # on expected, handled failures like a 404 existence check.
 
-GRAYLOG_API_BASE="http://127.0.0.1:${GRAYLOG_HTTP_PORT}/api"
+# 127.0.0.1 is one of the certificate's SANs, so these calls verify the
+# server against the deployment's own self-signed certificate.
+GRAYLOG_API_BASE="https://127.0.0.1:${GRAYLOG_HTTP_PORT}/api"
+GRAYLOG_API_CACERT="${GRAYLOG_TLS_DIR}/cert.pem"
 
 # graylog_curl <method> <path> [json_body]
 # Auths with $GRAYLOG_API_USER / $GRAYLOG_API_PASS (either the admin
@@ -20,7 +23,7 @@ GRAYLOG_API_BASE="http://127.0.0.1:${GRAYLOG_HTTP_PORT}/api"
 # later runs). Prints the response body; caller checks $? / status via -w.
 graylog_curl() {
   local method="$1" path="$2" body="${3:-}"
-  local args=(-fsS -X "${method}" -u "${GRAYLOG_API_USER}:${GRAYLOG_API_PASS}"
+  local args=(-fsS --cacert "${GRAYLOG_API_CACERT}" -X "${method}" -u "${GRAYLOG_API_USER}:${GRAYLOG_API_PASS}"
               -H 'X-Requested-By: graylog-stack-deploy' -H 'Accept: application/json')
   if [[ -n "${body}" ]]; then
     args+=(-H 'Content-Type: application/json' -d "${body}")
@@ -29,7 +32,7 @@ graylog_curl() {
 }
 
 graylog_api_reachable() {
-  curl -fsS -m 5 "http://127.0.0.1:${GRAYLOG_HTTP_PORT}/api/system/lbstatus" >/dev/null 2>&1
+  curl -fsS -m 5 --cacert "${GRAYLOG_API_CACERT}" "${GRAYLOG_API_BASE}/system/lbstatus" >/dev/null 2>&1
 }
 
 # graylog_ensure_automation_user <root_user> <root_pass> <username>
@@ -67,39 +70,66 @@ graylog_ensure_automation_user() {
   printf '%s' "${resp}" | jq -r '.id'
 }
 
-# graylog_create_api_token <root_user> <root_pass> <user_id> <token_name>
+# graylog_token_valid <token> - true if Graylog accepts the token.
+graylog_token_valid() {
+  GRAYLOG_API_USER="$1" GRAYLOG_API_PASS="token" graylog_curl GET "/system" >/dev/null 2>&1
+}
+
+# graylog_create_api_token <root_user> <root_pass> <user_id> <token_name> <ttl>
 # Token values are only ever returned at creation time (Graylog never
 # exposes them again via GET), so this always mints a fresh token - callers
-# are expected to persist the result themselves.
+# are expected to persist the result themselves. The TTL (ISO-8601 duration)
+# is passed explicitly: without one Graylog applies its default of 30 days,
+# after which every automated call would start failing with 401.
 graylog_create_api_token() {
-  local root_user="$1" root_pass="$2" user_id="$3" token_name="$4"
-  local resp
+  local root_user="$1" root_pass="$2" user_id="$3" token_name="$4" ttl="$5"
+  local resp body
+  body="$(jq -n --arg ttl "${ttl}" '{token_ttl: $ttl}')"
   if ! resp="$(GRAYLOG_API_USER="${root_user}" GRAYLOG_API_PASS="${root_pass}" \
-               graylog_curl POST "/users/${user_id}/tokens/${token_name}")"; then
+               graylog_curl POST "/users/${user_id}/tokens/${token_name}" "${body}")"; then
     return 1
   fi
   printf '%s' "${resp}" | jq -r '.token'
 }
 
-# graylog_ensure_syslog_input <title> <input_class> <port> <bind_address>
-# Idempotently creates a global Syslog input if one with this title doesn't
-# already exist.
-graylog_ensure_syslog_input() {
-  local title="$1" class="$2" port="$3" bind="${4:-0.0.0.0}"
-  local resp exists
+# graylog_input_tls_state <title>
+# Prints "absent", "tls" or "plain" for the input with this title, reading
+# back what Graylog actually stored rather than what was requested.
+graylog_input_tls_state() {
+  local title="$1" resp
   if ! resp="$(graylog_curl GET "/system/inputs")"; then
     return 1
   fi
-  exists="$(printf '%s' "${resp}" | jq -r --arg t "${title}" '.inputs[]? | select(.title==$t) | .id // empty')"
-  if [[ -n "${exists}" ]]; then
-    return 0
+  printf '%s' "${resp}" | jq -r --arg t "${title}" '
+    [.inputs[]? | select(.title==$t)] as $m
+    | if ($m | length) == 0 then "absent"
+      elif $m[0].attributes.tls_enable == true then "tls"
+      else "plain" end'
+}
+
+# graylog_ensure_syslog_input <title> <input_class> <port> [bind_address] [tls:true|false]
+# Idempotently creates a global Syslog input if one with this title doesn't
+# already exist. With tls=true the input uses the deployment's certificate
+# and key, and the call only succeeds if Graylog reports the stored input as
+# TLS-enabled - an existing plaintext input under that title is an error,
+# never silently accepted.
+graylog_ensure_syslog_input() {
+  local title="$1" class="$2" port="$3" bind="${4:-0.0.0.0}" tls="${5:-false}"
+  local state
+  if ! state="$(graylog_input_tls_state "${title}")"; then
+    return 1
+  fi
+  if [[ "${state}" != "absent" ]]; then
+    [[ "${tls}" != "true" || "${state}" == "tls" ]]
+    return
   fi
   local payload
-  payload="$(jq -n --arg title "${title}" --arg type "${class}" --argjson port "${port}" --arg bind "${bind}" '{
+  payload="$(jq -n --arg title "${title}" --arg type "${class}" --argjson port "${port}" --arg bind "${bind}" \
+                  --argjson tls "${tls}" --arg dir "${GRAYLOG_TLS_CONTAINER_DIR}" '{
     title: $title,
     type: $type,
     global: true,
-    configuration: {
+    configuration: ({
       bind_address: $bind,
       port: $port,
       recv_buffer_size: 262144,
@@ -108,10 +138,37 @@ graylog_ensure_syslog_input() {
       allow_override_date: true,
       store_full_message: false,
       expand_structured_data: false,
-      tls_enable: false
-    }
+      tls_enable: $tls
+    } + (if $tls then {
+      tls_cert_file: ($dir + "/cert.pem"),
+      tls_key_file: ($dir + "/key.pem"),
+      tls_client_auth: "disabled"
+    } else {} end))
   }')"
-  graylog_curl POST "/system/inputs" "${payload}" >/dev/null
+  if ! graylog_curl POST "/system/inputs" "${payload}" >/dev/null; then
+    return 1
+  fi
+  if [[ "${tls}" == "true" ]]; then
+    if ! state="$(graylog_input_tls_state "${title}")"; then
+      return 1
+    fi
+    [[ "${state}" == "tls" ]]
+  fi
+}
+
+# graylog_delete_input_by_title <title>
+# Removes every input with this title. Succeeds if there was nothing to remove.
+graylog_delete_input_by_title() {
+  local title="$1" resp id
+  if ! resp="$(graylog_curl GET "/system/inputs")"; then
+    return 1
+  fi
+  while IFS= read -r id; do
+    [[ -n "${id}" ]] || continue
+    if ! graylog_curl DELETE "/system/inputs/${id}" >/dev/null; then
+      return 1
+    fi
+  done < <(printf '%s' "${resp}" | jq -r --arg t "${title}" '.inputs[]? | select(.title==$t) | .id')
 }
 
 # graylog_set_cert_renewal_lifetime <ISO8601 duration, e.g. P3650D>

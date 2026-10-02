@@ -60,8 +60,10 @@ setup() {
   [[ "$output" == *"9000/tcp"* ]]
   [[ "$output" == *"1514/tcp"* ]]
   [[ "$output" == *"1514/udp"* ]]
-  # exactly 3 published ports, not more
-  [ "$(echo "$output" | wc -l)" -eq 3 ]
+  # exactly the expected published ports, not more (TLS syslog adds one)
+  local expected=3
+  [[ "${SYSLOG_TLS_ENABLED:-false}" == "true" ]] && expected=4
+  [ "$(echo "$output" | wc -l)" -eq "${expected}" ]
 }
 
 @test "bind mounts exist with correct ownership" {
@@ -89,8 +91,49 @@ setup() {
 }
 
 @test "Graylog HTTP API responds (lbstatus)" {
-  run curl -fsS -m 5 "http://127.0.0.1:${GRAYLOG_HTTP_PORT}/api/system/lbstatus"
+  run curl -fsS -m 5 --cacert "${GRAYLOG_TLS_DIR:-${DATA_ROOT}/tls}/cert.pem" "https://127.0.0.1:${GRAYLOG_HTTP_PORT}/api/system/lbstatus"
   [ "$status" -eq 0 ]
+}
+
+@test "Graylog refuses plain HTTP on the web port" {
+  run curl -fsS -m 5 "http://127.0.0.1:${GRAYLOG_HTTP_PORT}/api/system/lbstatus"
+  [ "$status" -ne 0 ]
+}
+
+@test "web certificate is valid for at least GRAYLOG_TLS_CERT_DAYS minus 30 days" {
+  local cert="${GRAYLOG_TLS_DIR:-${DATA_ROOT}/tls}/cert.pem"
+  run openssl x509 -in "${cert}" -noout -checkend $(( (${GRAYLOG_TLS_CERT_DAYS:-3650} - 30) * 86400 ))
+  [ "$status" -eq 0 ]
+}
+
+@test "TLS key and trust store are root:1100 0640 and readable inside the container" {
+  local dir="${GRAYLOG_TLS_DIR:-${DATA_ROOT}/tls}"
+  [ "$(stat -c '%u:%g %a' "${dir}/key.pem")" = "0:1100 640" ]
+  [ "$(stat -c '%u:%g %a' "${dir}/cacerts.jks")" = "0:1100 640" ]
+  run podman exec "${GRAYLOG_CONTAINER_NAME}" sh -c "test -r /etc/graylog-tls/key.pem && test -r /etc/graylog-tls/cacerts.jks"
+  [ "$status" -eq 0 ]
+}
+
+@test "Graylog can call its own API over TLS (cluster endpoint proxied via publish URI)" {
+  local dir="${GRAYLOG_TLS_DIR:-${DATA_ROOT}/tls}"
+  local token; token="$(cat "${SECRETS_DIR}/api_token")"
+  run curl -fsS -m 15 --cacert "${dir}/cert.pem" -u "${token}:token" "https://127.0.0.1:${GRAYLOG_HTTP_PORT}/api/cluster/inputstates"
+  [ "$status" -eq 0 ]
+  run podman logs --tail 2000 "${GRAYLOG_CONTAINER_NAME}"
+  [[ "$output" != *"PKIX path building failed"* ]]
+}
+
+@test "TLS syslog port completes a verified handshake when SYSLOG_TLS_ENABLED=true" {
+  [[ "${SYSLOG_TLS_ENABLED:-false}" == "true" ]] || skip "SYSLOG_TLS_ENABLED is not true"
+  local cert="${GRAYLOG_TLS_DIR:-${DATA_ROOT}/tls}/cert.pem"
+  run bash -c "timeout 5 openssl s_client -connect 127.0.0.1:${SYSLOG_TLS_PORT:-6514} -CAfile '${cert}' -verify_return_error </dev/null"
+  [ "$status" -eq 0 ]
+}
+
+@test "TLS syslog port is not listening when SYSLOG_TLS_ENABLED=false" {
+  [[ "${SYSLOG_TLS_ENABLED:-false}" == "false" ]] || skip "SYSLOG_TLS_ENABLED is true"
+  run bash -c "ss -Htln 'sport = :${SYSLOG_TLS_PORT:-6514}' | grep -q ."
+  [ "$status" -ne 0 ]
 }
 
 @test "Syslog TCP port is listening" {
@@ -113,11 +156,31 @@ setup() {
   [ "$status" -eq 0 ]
 }
 
-@test "firewalld has exactly the three expected ports open (plus whatever pre-existed)" {
-  run firewall-cmd --list-ports
-  [[ "$output" == *"${GRAYLOG_HTTP_PORT}/tcp"* ]]
-  [[ "$output" == *"${SYSLOG_TCP_PORT}/tcp"* ]]
-  [[ "$output" == *"${SYSLOG_UDP_PORT}/udp"* ]]
+@test "firewalld allows the expected ports (as port rules, or rich rules when sources are restricted)" {
+  local zone="${FIREWALL_ZONE:-}"
+  if [[ -z "${zone}" ]]; then
+    zone="$(cut -d'|' -f1 "${DATA_ROOT}/.manifest.firewall_rules" | head -1)"
+  fi
+  [[ -n "${zone}" ]] || zone="$(firewall-cmd --get-default-zone)"
+  run firewall-cmd --zone="${zone}" --list-all
+  [ "$status" -eq 0 ]
+  if [[ -n "${FIREWALL_ALLOWED_SOURCES:-}" ]]; then
+    [[ "$output" == *"port=\"${GRAYLOG_HTTP_PORT}\" protocol=\"tcp\" accept"* ]]
+    [[ "$output" == *"port=\"${SYSLOG_TCP_PORT}\" protocol=\"tcp\" accept"* ]]
+    [[ "$output" == *"port=\"${SYSLOG_UDP_PORT}\" protocol=\"udp\" accept"* ]]
+  else
+    [[ "$output" == *"${GRAYLOG_HTTP_PORT}/tcp"* ]]
+    [[ "$output" == *"${SYSLOG_TCP_PORT}/tcp"* ]]
+    [[ "$output" == *"${SYSLOG_UDP_PORT}/udp"* ]]
+  fi
+}
+
+@test "login banner shows the web URL and the health/stop/start commands" {
+  [ -f /etc/motd.d/90-graylog-stack ]
+  grep -q "${GRAYLOG_HTTP_EXTERNAL_URI}" /etc/motd.d/90-graylog-stack
+  grep -q "healthcheck.sh" /etc/motd.d/90-graylog-stack
+  grep -q "systemctl stop graylog graylog-datanode mongodb" /etc/motd.d/90-graylog-stack
+  grep -q "systemctl start graylog" /etc/motd.d/90-graylog-stack
 }
 
 @test "vm.max_map_count is persisted, not just runtime-set" {

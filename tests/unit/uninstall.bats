@@ -46,3 +46,11 @@ setup() { common_setup; }
 @test "uninstall.sh never calls setenforce or disables SELinux" {
   ! grep -q "setenforce" "${REPO_ROOT}/uninstall.sh"
 }
+
+@test "uninstall.sh reports installed packages before deleting the manifest" {
+  report_line="$(grep -n 'Packages installed by deploy.sh' "${REPO_ROOT}/uninstall.sh" | head -1 | cut -d: -f1)"
+  delete_line="$(grep -n 'rm -f "${MANIFEST_FILE}"' "${REPO_ROOT}/uninstall.sh" | head -1 | cut -d: -f1)"
+  [ -n "${report_line}" ]
+  [ -n "${delete_line}" ]
+  [ "${report_line}" -lt "${delete_line}" ]
+}
